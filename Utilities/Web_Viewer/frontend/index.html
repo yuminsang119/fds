@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FDS Web Viewer - Fire Dynamics Simulator</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Header -->
+        <header id="header">
+            <div class="header-left">
+                <h1>FDS Web Viewer</h1>
+                <span id="sim-title" class="sim-title">Fire Dynamics Simulator</span>
+            </div>
+            <div class="header-right">
+                <span id="fps-counter" class="fps">-- FPS</span>
+                <span id="frame-info" class="frame-info">Frame: 0/0</span>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <div id="main-content">
+            <!-- Left Panel - Controls -->
+            <div id="control-panel">
+                <div class="panel-section">
+                    <h3>Simulation</h3>
+                    <button id="btn-load-demo" class="btn btn-primary">Load Demo</button>
+                    <div class="info-row">
+                        <span>Time:</span>
+                        <span id="sim-time">0.00 s</span>
+                    </div>
+                    <div class="info-row">
+                        <span>Status:</span>
+                        <span id="sim-status" class="status-idle">Ready</span>
+                    </div>
+                </div>
+
+                <div class="panel-section">
+                    <h3>View Mode</h3>
+                    <div class="btn-group">
+                        <button id="btn-slice" class="btn btn-sm active" data-mode="slice">2D Slice</button>
+                        <button id="btn-volume" class="btn btn-sm" data-mode="volume">3D Volume</button>
+                    </div>
+                </div>
+
+                <div class="panel-section">
+                    <h3>Playback</h3>
+                    <div class="playback-controls">
+                        <button id="btn-prev" class="btn btn-icon" title="Previous">&#9664;&#9664;</button>
+                        <button id="btn-play" class="btn btn-icon btn-play" title="Play/Pause">&#9654;</button>
+                        <button id="btn-next" class="btn btn-icon" title="Next">&#9654;&#9654;</button>
+                    </div>
+                    <div class="slider-group">
+                        <label>Frame</label>
+                        <input type="range" id="frame-slider" min="0" max="0" value="0">
+                    </div>
+                    <div class="slider-group">
+                        <label>Speed</label>
+                        <input type="range" id="speed-slider" min="0.1" max="5" step="0.1" value="1">
+                        <span id="speed-label">1.0x</span>
+                    </div>
+                </div>
+
+                <div class="panel-section">
+                    <h3>Display</h3>
+                    <div class="slider-group">
+                        <label>Opacity</label>
+                        <input type="range" id="opacity-slider" min="0" max="1" step="0.05" value="0.8">
+                    </div>
+                    <div class="checkbox-group">
+                        <label><input type="checkbox" id="chk-grid" checked> Grid</label>
+                        <label><input type="checkbox" id="chk-axes" checked> Axes</label>
+                        <label><input type="checkbox" id="chk-wireframe"> Wireframe</label>
+                    </div>
+                    <div class="slider-group">
+                        <label>Colormap</label>
+                        <select id="colormap-select">
+                            <option value="fire">Fire</option>
+                            <option value="thermal">Thermal</option>
+                            <option value="rainbow">Rainbow</option>
+                            <option value="grayscale">Grayscale</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="panel-section">
+                    <h3>Data Range</h3>
+                    <div class="info-row">
+                        <span>Min:</span>
+                        <span id="data-min">--</span>
+                    </div>
+                    <div class="info-row">
+                        <span>Max:</span>
+                        <span id="data-max">--</span>
+                    </div>
+                    <div id="colorbar"></div>
+                </div>
+            </div>
+
+            <!-- 3D Viewport -->
+            <div id="viewport">
+                <canvas id="render-canvas"></canvas>
+                <div id="loading-overlay" class="hidden">
+                    <div class="spinner"></div>
+                    <p id="loading-text">Loading simulation data...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Three.js from CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="/static/js/colormaps.js"></script>
+    <script src="/static/js/viewer.js"></script>
+</body>
+</html>
