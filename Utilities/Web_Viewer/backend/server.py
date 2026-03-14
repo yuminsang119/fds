@@ -5,9 +5,12 @@ FastAPI server providing REST API and WebSocket for FDS simulation visualization
 
 import json
 import asyncio
+import tempfile
+import shutil
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import numpy as np
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,6 +26,13 @@ try:
 except ImportError:
     HAS_GPU = False
 
+# Spatial modules
+from spatial.scan_loader import load_ply, load_obj, load_las, PointCloud, TriMesh
+from spatial.alignment import (
+    SpatialTransform, compute_auto_alignment,
+    compute_marker_alignment, compute_icp,
+)
+
 app = FastAPI(title="FDS Web Viewer", version="2.0.0")
 
 app.add_middleware(
@@ -34,9 +44,14 @@ app.add_middleware(
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
+UPLOAD_DIR = BASE_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
 
 # Cache for demo data
 _demo_cache = None
+
+# Cache for scan data
+_scan_cache = {"point_cloud": None, "mesh": None, "transform": None}
 
 
 def get_demo_data():
@@ -109,6 +124,174 @@ async def parse_smv(smv_file: str):
         "n_slices": len(result["slices"]),
         "n_smoke3d": len(result["smoke3d"]),
     })
+
+
+# ── 3D Scan API ──────────────────────────────────────────────────────
+
+@app.post("/api/scan/upload")
+async def upload_scan(file: UploadFile = File(...)):
+    """Upload a 3D scan file (PLY, OBJ, LAS)."""
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in ('.ply', '.obj', '.las', '.laz'):
+        return JSONResponse(
+            {"error": f"Unsupported format: {suffix}. Use PLY, OBJ, or LAS."},
+            status_code=400,
+        )
+
+    # Save uploaded file
+    dest = UPLOAD_DIR / file.filename
+    with open(dest, 'wb') as f:
+        shutil.copyfileobj(file.file, f)
+
+    try:
+        if suffix == '.ply':
+            pc, mesh = load_ply(str(dest))
+            _scan_cache["point_cloud"] = pc
+            _scan_cache["mesh"] = mesh
+            result = {
+                "format": "ply",
+                "num_points": len(pc.points),
+                "has_colors": pc.colors is not None,
+                "has_normals": pc.normals is not None,
+                "has_mesh": mesh is not None,
+                "num_faces": len(mesh.faces) if mesh else 0,
+                "bounds_min": pc.bounds_min.tolist(),
+                "bounds_max": pc.bounds_max.tolist(),
+            }
+        elif suffix == '.obj':
+            mesh = load_obj(str(dest))
+            _scan_cache["point_cloud"] = PointCloud(
+                points=mesh.vertices,
+                colors=mesh.vertex_colors,
+                normals=mesh.normals,
+            )
+            _scan_cache["point_cloud"].compute_bounds()
+            _scan_cache["mesh"] = mesh
+            result = {
+                "format": "obj",
+                "num_vertices": len(mesh.vertices),
+                "num_faces": len(mesh.faces),
+                "has_colors": mesh.vertex_colors is not None,
+                "has_uvs": mesh.uvs is not None,
+                "bounds_min": mesh.bounds_min.tolist(),
+                "bounds_max": mesh.bounds_max.tolist(),
+            }
+        elif suffix in ('.las', '.laz'):
+            pc = load_las(str(dest))
+            _scan_cache["point_cloud"] = pc
+            _scan_cache["mesh"] = None
+            result = {
+                "format": "las",
+                "num_points": len(pc.points),
+                "has_colors": pc.colors is not None,
+                "has_intensity": pc.intensity is not None,
+                "bounds_min": pc.bounds_min.tolist(),
+                "bounds_max": pc.bounds_max.tolist(),
+            }
+        else:
+            return JSONResponse({"error": "Unsupported format"}, status_code=400)
+
+        return JSONResponse({"status": "ok", "filename": file.filename, **result})
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/scan/points")
+async def get_scan_points(max_points: int = 500000):
+    """Get scan point cloud data for rendering."""
+    pc = _scan_cache.get("point_cloud")
+    if pc is None:
+        return JSONResponse({"error": "No scan loaded"}, status_code=404)
+    return JSONResponse(pc.to_json(max_points=max_points))
+
+
+@app.get("/api/scan/mesh")
+async def get_scan_mesh(max_faces: int = 200000):
+    """Get scan mesh data for rendering."""
+    mesh = _scan_cache.get("mesh")
+    if mesh is None:
+        return JSONResponse({"error": "No mesh available"}, status_code=404)
+    return JSONResponse(mesh.to_json(max_faces=max_faces))
+
+
+@app.post("/api/scan/align/auto")
+async def auto_align_scan():
+    """Auto-align scan bounding box to FDS domain."""
+    pc = _scan_cache.get("point_cloud")
+    if pc is None:
+        return JSONResponse({"error": "No scan loaded"}, status_code=404)
+
+    data = get_demo_data()
+    b = data["bounds"]
+    fds_min = np.array([b["x"][0], b["y"][0], b["z"][0]])
+    fds_max = np.array([b["x"][1], b["y"][1], b["z"][1]])
+
+    transform = compute_auto_alignment(
+        pc.bounds_min, pc.bounds_max, fds_min, fds_max
+    )
+    _scan_cache["transform"] = transform
+    return JSONResponse(transform.to_dict())
+
+
+@app.post("/api/scan/align/markers")
+async def marker_align_scan(data: dict):
+    """Align using corresponding marker pairs."""
+    scan_markers = np.array(data["scan_markers"], dtype=np.float64)
+    fds_markers = np.array(data["fds_markers"], dtype=np.float64)
+
+    if len(scan_markers) < 3:
+        return JSONResponse({"error": "Need at least 3 marker pairs"}, status_code=400)
+
+    transform = compute_marker_alignment(scan_markers, fds_markers)
+    _scan_cache["transform"] = transform
+    return JSONResponse(transform.to_dict())
+
+
+@app.post("/api/scan/align/icp")
+async def icp_align_scan():
+    """Refine alignment using ICP registration."""
+    pc = _scan_cache.get("point_cloud")
+    if pc is None:
+        return JSONResponse({"error": "No scan loaded"}, status_code=404)
+
+    # Use FDS domain boundary points as target
+    data = get_demo_data()
+    b = data["bounds"]
+    # Generate target points from FDS domain
+    nx, ny, nz = 20, 20, 10
+    x = np.linspace(b["x"][0], b["x"][1], nx)
+    y = np.linspace(b["y"][0], b["y"][1], ny)
+    z = np.linspace(b["z"][0], b["z"][1], nz)
+    xx, yy, zz = np.meshgrid(x, y, z, indexing='ij')
+    target_points = np.column_stack([xx.ravel(), yy.ravel(), zz.ravel()])
+
+    # Apply existing transform first if any
+    source = pc.points.copy()
+    existing = _scan_cache.get("transform")
+    if existing:
+        source = existing.apply(source)
+
+    transform = compute_icp(source, target_points, max_iterations=30)
+    _scan_cache["transform"] = transform
+    return JSONResponse(transform.to_dict())
+
+
+@app.post("/api/scan/transform")
+async def set_scan_transform(data: dict):
+    """Set manual transform for the scan."""
+    transform = SpatialTransform.from_dict(data)
+    _scan_cache["transform"] = transform
+    return JSONResponse(transform.to_dict())
+
+
+@app.get("/api/scan/transform")
+async def get_scan_transform():
+    """Get current scan transform."""
+    transform = _scan_cache.get("transform")
+    if transform is None:
+        transform = SpatialTransform()
+    return JSONResponse(transform.to_dict())
 
 
 @app.websocket("/ws/stream")

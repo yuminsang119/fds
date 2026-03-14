@@ -35,6 +35,9 @@ class FDSViewer {
         // Ray marching renderer
         this.rayMarcher = null;
 
+        // 3D Scan renderer
+        this.scanRenderer = null;
+
         // Settings
         this.opacity = 0.8;
         this.colormapName = 'fire';
@@ -48,6 +51,7 @@ class FDSViewer {
 
         this.init();
         this.setupEventListeners();
+        this.setupScanControls();
         this.checkGPUStatus();
         this.animate();
     }
@@ -660,6 +664,200 @@ class FDSViewer {
         const el = document.getElementById('sim-status');
         el.textContent = text;
         el.className = cls;
+    }
+
+    // ── 3D Scan Controls ────────────────────────────────
+
+    setupScanControls() {
+        // Upload button
+        const uploadBtn = document.getElementById('btn-upload-scan');
+        const fileInput = document.getElementById('scan-file-input');
+
+        if (uploadBtn && fileInput) {
+            uploadBtn.addEventListener('click', () => fileInput.click());
+            fileInput.addEventListener('change', (e) => {
+                if (e.target.files.length > 0) {
+                    this.uploadScan(e.target.files[0]);
+                }
+            });
+        }
+
+        // Visibility
+        const chkVisible = document.getElementById('chk-scan-visible');
+        if (chkVisible) {
+            chkVisible.addEventListener('change', (e) => {
+                if (this.scanRenderer) this.scanRenderer.setVisible(e.target.checked);
+            });
+        }
+
+        // Render mode
+        const renderMode = document.getElementById('scan-render-mode');
+        if (renderMode) {
+            renderMode.addEventListener('change', (e) => {
+                if (this.scanRenderer) this.scanRenderer.setRenderMode(e.target.value);
+            });
+        }
+
+        // Point size
+        const pointSize = document.getElementById('scan-point-size');
+        if (pointSize) {
+            pointSize.addEventListener('input', (e) => {
+                if (this.scanRenderer) this.scanRenderer.setPointSize(parseFloat(e.target.value));
+            });
+        }
+
+        // Scan opacity
+        const scanOpacity = document.getElementById('scan-opacity');
+        if (scanOpacity) {
+            scanOpacity.addEventListener('input', (e) => {
+                if (this.scanRenderer) this.scanRenderer.setOpacity(parseFloat(e.target.value));
+            });
+        }
+
+        // Auto align
+        const autoAlign = document.getElementById('btn-auto-align');
+        if (autoAlign) {
+            autoAlign.addEventListener('click', () => this.autoAlignScan());
+        }
+
+        // ICP align
+        const icpAlign = document.getElementById('btn-icp-align');
+        if (icpAlign) {
+            icpAlign.addEventListener('click', () => this.icpAlignScan());
+        }
+
+        // Manual transform sliders
+        ['scan-offset-x', 'scan-offset-y', 'scan-offset-z', 'scan-scale', 'scan-rotation-y'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) {
+                el.addEventListener('input', () => this.updateScanManualTransform());
+            }
+        });
+    }
+
+    async uploadScan(file) {
+        this.showLoading(`Uploading ${file.name}...`);
+
+        const formData = new FormData();
+        formData.append('file', file);
+
+        try {
+            // Upload
+            const uploadRes = await fetch('/api/scan/upload', { method: 'POST', body: formData });
+            const uploadData = await uploadRes.json();
+
+            if (uploadData.error) {
+                alert('Upload error: ' + uploadData.error);
+                this.hideLoading();
+                return;
+            }
+
+            document.getElementById('scan-filename').textContent = file.name;
+            document.getElementById('scan-points').textContent =
+                (uploadData.num_points || uploadData.num_vertices || 0).toLocaleString();
+
+            // Initialize scan renderer
+            if (!this.scanRenderer) {
+                this.scanRenderer = new ScanRenderer(this.scene);
+            }
+
+            // Load point cloud
+            this.showLoading('Loading point cloud...');
+            const pcRes = await fetch('/api/scan/points?max_points=500000');
+            const pcData = await pcRes.json();
+
+            if (!pcData.error) {
+                this.scanRenderer.loadPointCloud(pcData);
+            }
+
+            // Load mesh if available
+            if (uploadData.has_mesh || uploadData.format === 'obj') {
+                this.showLoading('Loading mesh...');
+                const meshRes = await fetch('/api/scan/mesh?max_faces=200000');
+                const meshData = await meshRes.json();
+                if (!meshData.error) {
+                    this.scanRenderer.loadMesh(meshData);
+                    // Default to mesh mode if available
+                    this.scanRenderer.setRenderMode('mesh');
+                    const modeSelect = document.getElementById('scan-render-mode');
+                    if (modeSelect) modeSelect.value = 'mesh';
+                }
+            }
+
+            // Auto-align if simulation is loaded
+            if (this.metadata) {
+                await this.autoAlignScan();
+            }
+
+            this.hideLoading();
+            this.setStatus('Scan loaded', 'status-ready');
+
+        } catch (err) {
+            console.error('Scan upload failed:', err);
+            this.hideLoading();
+            alert('Failed to upload scan: ' + err.message);
+        }
+    }
+
+    async autoAlignScan() {
+        if (!this.scanRenderer) return;
+
+        try {
+            const res = await fetch('/api/scan/align/auto', { method: 'POST' });
+            const transform = await res.json();
+            this.scanRenderer.applyTransform(transform);
+
+            // Reset manual sliders
+            this.resetScanSliders();
+        } catch (err) {
+            console.error('Auto-align failed:', err);
+        }
+    }
+
+    async icpAlignScan() {
+        if (!this.scanRenderer) return;
+
+        this.showLoading('Running ICP alignment...');
+        try {
+            const res = await fetch('/api/scan/align/icp', { method: 'POST' });
+            const transform = await res.json();
+            this.scanRenderer.applyTransform(transform);
+            this.hideLoading();
+        } catch (err) {
+            console.error('ICP align failed:', err);
+            this.hideLoading();
+        }
+    }
+
+    updateScanManualTransform() {
+        if (!this.scanRenderer) return;
+
+        const ox = parseFloat(document.getElementById('scan-offset-x')?.value || 0);
+        const oy = parseFloat(document.getElementById('scan-offset-y')?.value || 0);
+        const oz = parseFloat(document.getElementById('scan-offset-z')?.value || 0);
+        const scale = parseFloat(document.getElementById('scan-scale')?.value || 1);
+        const rotY = parseFloat(document.getElementById('scan-rotation-y')?.value || 0);
+
+        document.getElementById('scan-scale-label').textContent = scale.toFixed(2);
+
+        this.scanRenderer.setManualTransform({
+            position: [ox, oy, oz],
+            rotation: [0, rotY, 0],
+            scale: scale,
+        });
+    }
+
+    resetScanSliders() {
+        ['scan-offset-x', 'scan-offset-y', 'scan-offset-z'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.value = 0;
+        });
+        const scaleEl = document.getElementById('scan-scale');
+        if (scaleEl) scaleEl.value = 1;
+        const rotEl = document.getElementById('scan-rotation-y');
+        if (rotEl) rotEl.value = 0;
+        const label = document.getElementById('scan-scale-label');
+        if (label) label.textContent = '1.00';
     }
 }
 

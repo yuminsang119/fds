@@ -123,6 +123,65 @@
                 </div>
 
                 <div class="panel-section">
+                    <h3>3D Scan</h3>
+                    <div class="file-upload">
+                        <input type="file" id="scan-file-input" accept=".ply,.obj,.las,.laz" style="display:none">
+                        <button id="btn-upload-scan" class="btn btn-primary">Upload Scan</button>
+                    </div>
+                    <div class="info-row">
+                        <span>File:</span>
+                        <span id="scan-filename">None</span>
+                    </div>
+                    <div class="info-row">
+                        <span>Points:</span>
+                        <span id="scan-points">--</span>
+                    </div>
+                    <div class="checkbox-group">
+                        <label><input type="checkbox" id="chk-scan-visible" checked> Show Scan</label>
+                    </div>
+                    <div class="slider-group">
+                        <label>Scan Render</label>
+                        <select id="scan-render-mode">
+                            <option value="points">Points</option>
+                            <option value="mesh">Mesh</option>
+                            <option value="wireframe">Wireframe</option>
+                        </select>
+                    </div>
+                    <div class="slider-group">
+                        <label>Point Size</label>
+                        <input type="range" id="scan-point-size" min="0.5" max="10" step="0.5" value="2">
+                    </div>
+                    <div class="slider-group">
+                        <label>Scan Opacity</label>
+                        <input type="range" id="scan-opacity" min="0" max="1" step="0.05" value="0.85">
+                    </div>
+                    <h3 style="margin-top:10px">Alignment</h3>
+                    <button id="btn-auto-align" class="btn btn-sm" style="width:100%;margin-bottom:4px">Auto Align</button>
+                    <button id="btn-icp-align" class="btn btn-sm" style="width:100%;margin-bottom:4px">ICP Refine</button>
+                    <div class="slider-group">
+                        <label>X Offset</label>
+                        <input type="range" id="scan-offset-x" min="-10" max="10" step="0.1" value="0">
+                    </div>
+                    <div class="slider-group">
+                        <label>Y Offset</label>
+                        <input type="range" id="scan-offset-y" min="-10" max="10" step="0.1" value="0">
+                    </div>
+                    <div class="slider-group">
+                        <label>Z Offset</label>
+                        <input type="range" id="scan-offset-z" min="-10" max="10" step="0.1" value="0">
+                    </div>
+                    <div class="slider-group">
+                        <label>Scale</label>
+                        <input type="range" id="scan-scale" min="0.01" max="10" step="0.01" value="1">
+                        <span id="scan-scale-label">1.00</span>
+                    </div>
+                    <div class="slider-group">
+                        <label>Y Rotation</label>
+                        <input type="range" id="scan-rotation-y" min="0" max="360" step="1" value="0">
+                    </div>
+                </div>
+
+                <div class="panel-section">
                     <h3>Data Range</h3>
                     <div class="info-row">
                         <span>Min:</span>
@@ -152,6 +211,7 @@
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
     <script src="/static/js/colormaps.js"></script>
     <script src="/static/js/volume_raymarcher.js"></script>
+    <script src="/static/js/scan_renderer.js"></script>
     <script src="/static/js/viewer.js"></script>
 </body>
 </html>
