@@ -1,6 +1,7 @@
 /**
  * FDS Web Viewer - Main 3D Viewer
  * Three.js based visualization for FDS simulation results.
+ * Supports 2D slice, 3D point cloud, and GPU ray marching volume rendering.
  */
 
 class FDSViewer {
@@ -16,12 +17,13 @@ class FDSViewer {
         this.volumeFrames = [];
         this.metadata = null;
         this.currentFrame = 0;
-        this.viewMode = 'slice'; // 'slice' or 'volume'
+        this.viewMode = 'slice'; // 'slice', 'volume', or 'raymarch'
 
         // Playback
         this.isPlaying = false;
         this.playbackSpeed = 1.0;
         this.lastFrameTime = 0;
+        this.lastAnimTime = 0;
 
         // Scene objects
         this.sliceMesh = null;
@@ -29,6 +31,9 @@ class FDSViewer {
         this.gridHelper = null;
         this.axesHelper = null;
         this.boundingBox = null;
+
+        // Ray marching renderer
+        this.rayMarcher = null;
 
         // Settings
         this.opacity = 0.8;
@@ -43,6 +48,7 @@ class FDSViewer {
 
         this.init();
         this.setupEventListeners();
+        this.checkGPUStatus();
         this.animate();
     }
 
@@ -106,7 +112,14 @@ class FDSViewer {
                 e.target.classList.add('active');
                 this.viewMode = e.target.dataset.mode;
                 this.currentFrame = 0;
+                this.clearSceneObjects();
                 this.updateView();
+
+                // Show/hide ray marching controls
+                const rmControls = document.getElementById('raymarch-controls');
+                if (rmControls) {
+                    rmControls.style.display = this.viewMode === 'raymarch' ? 'block' : 'none';
+                }
             });
         });
 
@@ -130,6 +143,9 @@ class FDSViewer {
         // Opacity
         document.getElementById('opacity-slider').addEventListener('input', (e) => {
             this.opacity = parseFloat(e.target.value);
+            if (this.rayMarcher) {
+                this.rayMarcher.setParams({ opacity: this.opacity });
+            }
             this.updateView();
         });
 
@@ -155,6 +171,97 @@ class FDSViewer {
             this.updateColorbar();
             this.updateView();
         });
+
+        // Ray Marching controls
+        this.setupRayMarchControls();
+    }
+
+    setupRayMarchControls() {
+        const densitySlider = document.getElementById('density-slider');
+        const stepsSlider = document.getElementById('steps-slider');
+        const absorptionSlider = document.getElementById('absorption-slider');
+        const lightSlider = document.getElementById('light-slider');
+        const renderModeSelect = document.getElementById('render-mode-select');
+
+        if (densitySlider) {
+            densitySlider.addEventListener('input', (e) => {
+                const val = parseFloat(e.target.value);
+                document.getElementById('density-label').textContent = val.toFixed(1);
+                if (this.rayMarcher) this.rayMarcher.setParams({ density: val });
+            });
+        }
+
+        if (stepsSlider) {
+            stepsSlider.addEventListener('input', (e) => {
+                const val = parseInt(e.target.value);
+                document.getElementById('steps-label').textContent = val;
+                if (this.rayMarcher) this.rayMarcher.setParams({ steps: val });
+            });
+        }
+
+        if (absorptionSlider) {
+            absorptionSlider.addEventListener('input', (e) => {
+                const val = parseInt(e.target.value);
+                document.getElementById('absorption-label').textContent = val;
+                if (this.rayMarcher) this.rayMarcher.setParams({ absorption: val });
+            });
+        }
+
+        if (lightSlider) {
+            lightSlider.addEventListener('input', (e) => {
+                const val = parseFloat(e.target.value);
+                document.getElementById('light-label').textContent = val.toFixed(1);
+                if (this.rayMarcher) this.rayMarcher.setParams({ lightIntensity: val });
+            });
+        }
+
+        if (renderModeSelect) {
+            renderModeSelect.addEventListener('change', (e) => {
+                const mode = parseInt(e.target.value);
+                if (this.rayMarcher) this.rayMarcher.setParams({ colorMode: mode });
+            });
+        }
+    }
+
+    async checkGPUStatus() {
+        try {
+            const res = await fetch('/api/gpu/status');
+            const data = await res.json();
+            const el = document.getElementById('gpu-status');
+            if (el) {
+                if (data.available && data.renderer && data.renderer.num_gpus > 0) {
+                    const gpus = data.renderer.gpus;
+                    el.textContent = `${gpus.length}x ${gpus[0].name}`;
+                    el.style.color = '#2ecc71';
+                } else {
+                    el.textContent = 'WebGL (Client)';
+                    el.style.color = '#f39c12';
+                }
+            }
+        } catch {
+            const el = document.getElementById('gpu-status');
+            if (el) {
+                el.textContent = 'WebGL (Client)';
+                el.style.color = '#f39c12';
+            }
+        }
+    }
+
+    clearSceneObjects() {
+        if (this.sliceMesh) {
+            this.scene.remove(this.sliceMesh);
+            this.sliceMesh.geometry.dispose();
+            this.sliceMesh.material.dispose();
+            this.sliceMesh = null;
+        }
+        if (this.volumeGroup) {
+            this.scene.remove(this.volumeGroup);
+            this.volumeGroup = null;
+        }
+        if (this.rayMarcher) {
+            this.rayMarcher.dispose();
+            this.rayMarcher = null;
+        }
     }
 
     async loadDemo() {
@@ -192,10 +299,7 @@ class FDSViewer {
             this.updateColorbar();
 
             // Set slider
-            const maxFrame = this.viewMode === 'slice'
-                ? this.sliceFrames.length - 1
-                : this.volumeFrames.length - 1;
-            document.getElementById('frame-slider').max = maxFrame;
+            this.updateSliderMax();
 
             this.currentFrame = 0;
             this.updateView();
@@ -207,6 +311,16 @@ class FDSViewer {
             this.hideLoading();
             this.setStatus('Error', 'status-idle');
         }
+    }
+
+    updateSliderMax() {
+        let maxFrame = 0;
+        if (this.viewMode === 'slice') {
+            maxFrame = this.sliceFrames.length - 1;
+        } else {
+            maxFrame = this.volumeFrames.length - 1;
+        }
+        document.getElementById('frame-slider').max = Math.max(0, maxFrame);
     }
 
     setupBoundingBox() {
@@ -242,13 +356,13 @@ class FDSViewer {
     updateView() {
         if (this.viewMode === 'slice') {
             this.updateSliceView();
-        } else {
+        } else if (this.viewMode === 'volume') {
             this.updateVolumeView();
+        } else if (this.viewMode === 'raymarch') {
+            this.updateRayMarchView();
         }
 
-        // Update slider max
-        const frames = this.viewMode === 'slice' ? this.sliceFrames : this.volumeFrames;
-        document.getElementById('frame-slider').max = Math.max(0, frames.length - 1);
+        this.updateSliderMax();
         document.getElementById('frame-slider').value = this.currentFrame;
     }
 
@@ -257,6 +371,10 @@ class FDSViewer {
         if (this.volumeGroup) {
             this.scene.remove(this.volumeGroup);
             this.volumeGroup = null;
+        }
+        if (this.rayMarcher) {
+            this.rayMarcher.dispose();
+            this.rayMarcher = null;
         }
 
         if (!this.sliceFrames.length) return;
@@ -306,7 +424,6 @@ class FDSViewer {
                 wireframe: this.showWireframe,
             });
             this.sliceMesh = new THREE.Mesh(geometry, material);
-            // Place slice at z=1.5 (plane_value)
             this.sliceMesh.rotation.x = -Math.PI / 2;
             this.sliceMesh.position.set(
                 (b.x[0] + b.x[1]) / 2,
@@ -328,6 +445,10 @@ class FDSViewer {
         if (this.sliceMesh) {
             this.scene.remove(this.sliceMesh);
             this.sliceMesh = null;
+        }
+        if (this.rayMarcher) {
+            this.rayMarcher.dispose();
+            this.rayMarcher = null;
         }
 
         if (!this.volumeFrames.length) return;
@@ -351,10 +472,8 @@ class FDSViewer {
         const dz = (b.z[1] - b.z[0]) / nz;
         const colormapFn = Colormaps[this.colormapName] || Colormaps.fire;
 
-        // Render as point cloud for performance
         const positions = [];
         const colors = [];
-        const sizes = [];
         const threshold = 0.05;
 
         for (let iz = 0; iz < nz; iz++) {
@@ -365,13 +484,12 @@ class FDSViewer {
 
                     if (val > threshold) {
                         const x = b.x[0] + (ix + 0.5) * dx;
-                        const y = b.z[0] + (iz + 0.5) * dz; // z -> y in Three.js
+                        const y = b.z[0] + (iz + 0.5) * dz;
                         const z = b.y[0] + (iy + 0.5) * dy;
 
                         positions.push(x, y, z);
                         const [r, g, bb] = colormapFn(val);
                         colors.push(r, g, bb);
-                        sizes.push(Math.max(dx, dy, dz) * 1.5 * val);
                     }
                 }
             }
@@ -398,10 +516,59 @@ class FDSViewer {
 
         this.scene.add(this.volumeGroup);
 
-        // Update UI
         document.getElementById('sim-time').textContent = frame.time.toFixed(2) + ' s';
         document.getElementById('data-min').textContent = '0.00';
         document.getElementById('data-max').textContent = maxVal.toFixed(3);
+        document.getElementById('frame-info').textContent = `Frame: ${this.currentFrame + 1}/${this.volumeFrames.length}`;
+    }
+
+    updateRayMarchView() {
+        // Remove other renderers
+        if (this.sliceMesh) {
+            this.scene.remove(this.sliceMesh);
+            this.sliceMesh = null;
+        }
+        if (this.volumeGroup) {
+            this.scene.remove(this.volumeGroup);
+            this.volumeGroup = null;
+        }
+
+        if (!this.volumeFrames.length || !this.metadata) return;
+
+        const frame = this.volumeFrames[this.currentFrame] || this.volumeFrames[0];
+
+        // Initialize ray marcher if needed
+        if (!this.rayMarcher) {
+            this.rayMarcher = new VolumeRayMarcher(this.scene, this.metadata.bounds);
+        }
+
+        // Update or init volume data
+        if (this.rayMarcher.volumeTexture) {
+            this.rayMarcher.updateData(frame.data, frame.nx, frame.ny, frame.nz);
+        } else {
+            const success = this.rayMarcher.init(frame.data, frame.nx, frame.ny, frame.nz);
+            if (!success) {
+                console.warn('Ray marching not supported, falling back to point cloud');
+                this.viewMode = 'volume';
+                this.updateVolumeView();
+                return;
+            }
+        }
+
+        // Apply current settings
+        const renderMode = document.getElementById('render-mode-select');
+        this.rayMarcher.setParams({
+            opacity: this.opacity,
+            colorMode: renderMode ? parseInt(renderMode.value) : 0,
+            density: parseFloat(document.getElementById('density-slider')?.value || 5),
+            steps: parseInt(document.getElementById('steps-slider')?.value || 256),
+            absorption: parseInt(document.getElementById('absorption-slider')?.value || 40),
+            lightIntensity: parseFloat(document.getElementById('light-slider')?.value || 2),
+        });
+
+        document.getElementById('sim-time').textContent = frame.time.toFixed(2) + ' s';
+        document.getElementById('data-min').textContent = '0.00';
+        document.getElementById('data-max').textContent = (frame.max_val || 0).toFixed(3);
         document.getElementById('frame-info').textContent = `Frame: ${this.currentFrame + 1}/${this.volumeFrames.length}`;
     }
 
@@ -443,9 +610,12 @@ class FDSViewer {
     animate() {
         requestAnimationFrame(() => this.animate());
 
+        const now = performance.now();
+        const deltaTime = (now - (this.lastAnimTime || now)) / 1000;
+        this.lastAnimTime = now;
+
         // FPS counter
         this.frameCount++;
-        const now = performance.now();
         if (now - this.fpsTime >= 1000) {
             document.getElementById('fps-counter').textContent = this.frameCount + ' FPS';
             this.frameCount = 0;
@@ -456,6 +626,11 @@ class FDSViewer {
         if (this.isPlaying && now - this.lastFrameTime > (100 / this.playbackSpeed)) {
             this.nextFrame();
             this.lastFrameTime = now;
+        }
+
+        // Update ray marcher camera position
+        if (this.rayMarcher) {
+            this.rayMarcher.update(this.camera, deltaTime);
         }
 
         this.controls.update();
