@@ -7,6 +7,12 @@ Supports manual transform, ICP registration, and marker-based alignment.
 import numpy as np
 from dataclasses import dataclass
 
+try:
+    from scipy.spatial import cKDTree
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
 
 @dataclass
 class SpatialTransform:
@@ -157,13 +163,19 @@ def compute_icp(
     t_total = np.zeros(3, dtype=np.float64)
     prev_error = float('inf')
 
+    # Build KD-tree for fast nearest-neighbor queries (O(n log n) vs O(n²))
+    if HAS_SCIPY:
+        tree = cKDTree(tgt)
+
     for iteration in range(max_iterations):
-        # Find closest points (brute force for simplicity)
-        # For large clouds, a KD-tree would be better
-        correspondences = np.zeros(len(src), dtype=np.int32)
-        for i, p in enumerate(src):
-            dists = np.sum((tgt - p) ** 2, axis=1)
-            correspondences[i] = np.argmin(dists)
+        # Find closest points using KD-tree (O(n log m)) or brute-force fallback
+        if HAS_SCIPY:
+            _, correspondences = tree.query(src, k=1)
+        else:
+            correspondences = np.zeros(len(src), dtype=np.int32)
+            for i, p in enumerate(src):
+                dists = np.sum((tgt - p) ** 2, axis=1)
+                correspondences[i] = np.argmin(dists)
 
         matched_target = tgt[correspondences]
 

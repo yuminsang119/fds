@@ -38,6 +38,14 @@ class FDSViewer {
         // 3D Scan renderer
         this.scanRenderer = null;
 
+        // Web Worker for offloading data processing
+        this.dataWorker = null;
+        try {
+            this.dataWorker = new Worker('/static/js/data_worker.js');
+        } catch (e) {
+            console.warn('Web Worker not available, using main thread');
+        }
+
         // Settings
         this.opacity = 0.8;
         this.colormapName = 'fire';
@@ -279,23 +287,34 @@ class FDSViewer {
 
             document.getElementById('sim-title').textContent = this.metadata.title;
 
-            // Fetch all slice frames
+            // Fetch all slice frames (parallel batch loading)
             this.showLoading('Loading slice frames...');
             this.sliceFrames = [];
-            for (let i = 0; i < this.metadata.n_slice_frames; i++) {
-                const res = await fetch(`/api/demo/slice/${i}`);
-                this.sliceFrames.push(await res.json());
-                if (i % 10 === 0) {
-                    this.showLoading(`Loading slices... ${i}/${this.metadata.n_slice_frames}`);
+            const BATCH_SIZE = 8;
+            const nSlice = this.metadata.n_slice_frames;
+            for (let i = 0; i < nSlice; i += BATCH_SIZE) {
+                const batchEnd = Math.min(i + BATCH_SIZE, nSlice);
+                const batch = [];
+                for (let j = i; j < batchEnd; j++) {
+                    batch.push(fetch(`/api/demo/slice/${j}`).then(r => r.json()));
                 }
+                const results = await Promise.all(batch);
+                this.sliceFrames.push(...results);
+                this.showLoading(`Loading slices... ${batchEnd}/${nSlice}`);
             }
 
-            // Fetch volume frames
+            // Fetch volume frames (parallel batch loading)
             this.showLoading('Loading volume frames...');
             this.volumeFrames = [];
-            for (let i = 0; i < this.metadata.n_volume_frames; i++) {
-                const res = await fetch(`/api/demo/volume/${i}`);
-                this.volumeFrames.push(await res.json());
+            const nVol = this.metadata.n_volume_frames;
+            for (let i = 0; i < nVol; i += BATCH_SIZE) {
+                const batchEnd = Math.min(i + BATCH_SIZE, nVol);
+                const batch = [];
+                for (let j = i; j < batchEnd; j++) {
+                    batch.push(fetch(`/api/demo/volume/${j}`).then(r => r.json()));
+                }
+                const results = await Promise.all(batch);
+                this.volumeFrames.push(...results);
             }
 
             // Setup scene
@@ -393,15 +412,31 @@ class FDSViewer {
 
         // Create texture from data
         const texData = new Uint8Array(nx * ny * 4);
-        const colormapFn = Colormaps[this.colormapName] || Colormaps.fire;
+        // Use pre-computed colormap LUT for fast lookup
+        if (!this._sliceLUT || this._sliceLUTName !== this.colormapName) {
+            this._sliceLUTName = this.colormapName;
+            const colormapFn = Colormaps[this.colormapName] || Colormaps.fire;
+            this._sliceLUT = new Uint8Array(256 * 4);
+            for (let i = 0; i < 256; i++) {
+                const [r, g, b] = colormapFn(i / 255);
+                this._sliceLUT[i * 4] = (r * 255) | 0;
+                this._sliceLUT[i * 4 + 1] = (g * 255) | 0;
+                this._sliceLUT[i * 4 + 2] = (b * 255) | 0;
+                this._sliceLUT[i * 4 + 3] = 255;
+            }
+        }
+        const lut = this._sliceLUT;
+        const alpha = (this.opacity * 255) | 0;
+        const invRange = 1.0 / range;
 
         for (let i = 0; i < nx * ny; i++) {
-            const t = (data[i] - minVal) / range;
-            const [r, g, b] = colormapFn(t);
-            texData[i * 4] = (r * 255) | 0;
-            texData[i * 4 + 1] = (g * 255) | 0;
-            texData[i * 4 + 2] = (b * 255) | 0;
-            texData[i * 4 + 3] = (this.opacity * 255) | 0;
+            const lutIdx = ((data[i] - minVal) * invRange * 255) | 0;
+            const li = Math.max(0, Math.min(255, lutIdx)) * 4;
+            const ti = i * 4;
+            texData[ti] = lut[li];
+            texData[ti + 1] = lut[li + 1];
+            texData[ti + 2] = lut[li + 2];
+            texData[ti + 3] = alpha;
         }
 
         const texture = new THREE.DataTexture(texData, nx, ny, THREE.RGBAFormat);
@@ -476,46 +511,78 @@ class FDSViewer {
         const dz = (b.z[1] - b.z[0]) / nz;
         const colormapFn = Colormaps[this.colormapName] || Colormaps.fire;
 
-        const positions = [];
-        const colors = [];
         const threshold = 0.05;
+        const invMaxVal = 1.0 / maxVal;
 
+        // Pre-compute colormap LUT (256 entries)
+        const LUT_SIZE = 256;
+        const lutR = new Float32Array(LUT_SIZE);
+        const lutG = new Float32Array(LUT_SIZE);
+        const lutB = new Float32Array(LUT_SIZE);
+        for (let i = 0; i < LUT_SIZE; i++) {
+            const [r, g, b] = colormapFn(i / (LUT_SIZE - 1));
+            lutR[i] = r; lutG[i] = g; lutB[i] = b;
+        }
+
+        // Pre-allocate max-size buffers (reuse across frames)
+        const totalVoxels = nx * ny * nz;
+        if (!this._volPosBuffer || this._volPosBuffer.length < totalVoxels * 3) {
+            this._volPosBuffer = new Float32Array(totalVoxels * 3);
+            this._volColBuffer = new Float32Array(totalVoxels * 3);
+        }
+        const positions = this._volPosBuffer;
+        const colors = this._volColBuffer;
+        let pointCount = 0;
+
+        // Single-pass filtering with LUT lookup
         for (let iz = 0; iz < nz; iz++) {
+            const y = b.z[0] + (iz + 0.5) * dz;
+            const izOffset = iz * ny * nx;
             for (let iy = 0; iy < ny; iy++) {
+                const z = b.y[0] + (iy + 0.5) * dy;
+                const iyOffset = izOffset + iy * nx;
                 for (let ix = 0; ix < nx; ix++) {
-                    const idx = iz * ny * nx + iy * nx + ix;
-                    const val = data[idx] / maxVal;
-
+                    const val = data[iyOffset + ix] * invMaxVal;
                     if (val > threshold) {
-                        const x = b.x[0] + (ix + 0.5) * dx;
-                        const y = b.z[0] + (iz + 0.5) * dz;
-                        const z = b.y[0] + (iy + 0.5) * dy;
-
-                        positions.push(x, y, z);
-                        const [r, g, bb] = colormapFn(val);
-                        colors.push(r, g, bb);
+                        const p3 = pointCount * 3;
+                        positions[p3] = b.x[0] + (ix + 0.5) * dx;
+                        positions[p3 + 1] = y;
+                        positions[p3 + 2] = z;
+                        const lutIdx = (val * (LUT_SIZE - 1)) | 0;
+                        colors[p3] = lutR[lutIdx];
+                        colors[p3 + 1] = lutG[lutIdx];
+                        colors[p3 + 2] = lutB[lutIdx];
+                        pointCount++;
                     }
                 }
             }
         }
 
-        if (positions.length > 0) {
-            const geometry = new THREE.BufferGeometry();
-            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-            geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+        if (pointCount > 0) {
+            // Reuse geometry if possible
+            if (!this._volumeGeometry) {
+                this._volumeGeometry = new THREE.BufferGeometry();
+                this._volumeGeometry.setAttribute('position',
+                    new THREE.BufferAttribute(positions, 3));
+                this._volumeGeometry.setAttribute('color',
+                    new THREE.BufferAttribute(colors, 3));
+                this._volumeMaterial = new THREE.PointsMaterial({
+                    size: Math.max(dx, dy, dz) * 2,
+                    vertexColors: true,
+                    transparent: true,
+                    opacity: this.opacity * 0.7,
+                    sizeAttenuation: true,
+                    blending: THREE.AdditiveBlending,
+                    depthWrite: false,
+                });
+                this._volumePoints = new THREE.Points(this._volumeGeometry, this._volumeMaterial);
+            }
+            this._volumeGeometry.attributes.position.needsUpdate = true;
+            this._volumeGeometry.attributes.color.needsUpdate = true;
+            this._volumeGeometry.setDrawRange(0, pointCount);
+            this._volumeMaterial.opacity = this.opacity * 0.7;
 
-            const material = new THREE.PointsMaterial({
-                size: Math.max(dx, dy, dz) * 2,
-                vertexColors: true,
-                transparent: true,
-                opacity: this.opacity * 0.7,
-                sizeAttenuation: true,
-                blending: THREE.AdditiveBlending,
-                depthWrite: false,
-            });
-
-            const points = new THREE.Points(geometry, material);
-            this.volumeGroup.add(points);
+            this.volumeGroup.add(this._volumePoints);
         }
 
         this.scene.add(this.volumeGroup);
@@ -546,11 +613,11 @@ class FDSViewer {
             this.rayMarcher = new VolumeRayMarcher(this.scene, this.metadata.bounds);
         }
 
-        // Update or init volume data
+        // Update or init volume data (pass max_val to skip normalization scan)
         if (this.rayMarcher.volumeTexture) {
-            this.rayMarcher.updateData(frame.data, frame.nx, frame.ny, frame.nz);
+            this.rayMarcher.updateData(frame.data, frame.nx, frame.ny, frame.nz, frame.max_val);
         } else {
-            const success = this.rayMarcher.init(frame.data, frame.nx, frame.ny, frame.nz);
+            const success = this.rayMarcher.init(frame.data, frame.nx, frame.ny, frame.nz, frame.max_val);
             if (!success) {
                 console.warn('Ray marching not supported, falling back to point cloud');
                 this.viewMode = 'volume';
@@ -761,35 +828,46 @@ class FDSViewer {
                 this.scanRenderer = new ScanRenderer(this.scene);
             }
 
-            // Load point cloud
-            this.showLoading('Loading point cloud...');
-            const pcRes = await fetch('/api/scan/points?max_points=500000');
-            const pcData = await pcRes.json();
-
-            if (!pcData.error) {
-                this.scanRenderer.loadPointCloud(pcData);
+            // Progressive point cloud loading: fast preview → full detail
+            this.showLoading('Loading preview...');
+            const previewRes = await fetch('/api/scan/points?max_points=100000');
+            const previewData = await previewRes.json();
+            if (!previewData.error) {
+                this.scanRenderer.loadPointCloud(previewData);
             }
 
-            // Load mesh if available
-            if (uploadData.has_mesh || uploadData.format === 'obj') {
-                this.showLoading('Loading mesh...');
-                const meshRes = await fetch('/api/scan/mesh?max_faces=200000');
-                const meshData = await meshRes.json();
-                if (!meshData.error) {
-                    this.scanRenderer.loadMesh(meshData);
-                    // Default to mesh mode if available
-                    this.scanRenderer.setRenderMode('mesh');
-                    const modeSelect = document.getElementById('scan-render-mode');
-                    if (modeSelect) modeSelect.value = 'mesh';
-                }
-            }
-
-            // Auto-align if simulation is loaded
+            // Auto-align early so user sees positioned data
             if (this.metadata) {
                 await this.autoAlignScan();
             }
-
             this.hideLoading();
+            this.setStatus('Loading detail...', 'status-loading');
+
+            // Load full detail in background
+            const loadFullDetail = async () => {
+                const fullRes = await fetch('/api/scan/points?max_points=500000');
+                const fullData = await fullRes.json();
+                if (!fullData.error) {
+                    this.scanRenderer.loadPointCloud(fullData);
+                }
+            };
+
+            // Load mesh if available (parallel with full points)
+            const loadMesh = async () => {
+                if (uploadData.has_mesh || uploadData.format === 'obj') {
+                    const meshRes = await fetch('/api/scan/mesh?max_faces=200000');
+                    const meshData = await meshRes.json();
+                    if (!meshData.error) {
+                        this.scanRenderer.loadMesh(meshData);
+                        this.scanRenderer.setRenderMode('mesh');
+                        const modeSelect = document.getElementById('scan-render-mode');
+                        if (modeSelect) modeSelect.value = 'mesh';
+                    }
+                }
+            };
+
+            // Load full points and mesh in parallel
+            await Promise.all([loadFullDetail(), loadMesh()]);
             this.setStatus('Scan loaded', 'status-ready');
 
         } catch (err) {

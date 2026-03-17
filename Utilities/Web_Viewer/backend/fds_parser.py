@@ -213,17 +213,17 @@ def generate_demo_data(nx=50, ny=50, nz=30, n_frames=60) -> dict:
         t = frame_idx / 10.0
         temp_data = np.full((ny, nx), 20.0, dtype=np.float32)
 
-        # Fire source at center
+        # Fire source at center (vectorized)
         cx, cy = nx // 2, ny // 2
-        for iy in range(ny):
-            for ix in range(nx):
-                r = np.sqrt((ix - cx) ** 2 + (iy - cy) ** 2)
-                spread = min(t * 2, 10)
-                if r < spread:
-                    intensity = max(0, 1 - r / max(spread, 0.1))
-                    temp_data[iy, ix] = 20 + 800 * intensity * min(t / 3.0, 1.0)
-                    # Add turbulent fluctuation
-                    temp_data[iy, ix] += np.random.normal(0, 20) * intensity
+        ix = np.arange(nx)[None, :]  # (1, nx)
+        iy = np.arange(ny)[:, None]  # (ny, 1)
+        r = np.sqrt((ix - cx) ** 2 + (iy - cy) ** 2).astype(np.float32)
+        spread = min(t * 2, 10)
+        mask = r < spread
+        intensity = np.maximum(0, 1 - r / max(spread, 0.1))
+        temp_data[mask] = 20 + 800 * intensity[mask] * min(t / 3.0, 1.0)
+        noise = np.random.normal(0, 20, size=(ny, nx)).astype(np.float32) * intensity
+        temp_data[mask] += noise[mask]
 
         result["slices"].append({
             "time": round(t, 2),
@@ -245,19 +245,23 @@ def generate_demo_data(nx=50, ny=50, nz=30, n_frames=60) -> dict:
         smoke = np.zeros((vol_nz, vol_ny, vol_nx), dtype=np.float32)
 
         cx, cy = vol_nx // 2, vol_ny // 2
-        for iz in range(vol_nz):
-            z_frac = iz / vol_nz
-            for iy in range(vol_ny):
-                for ix in range(vol_nx):
-                    r = np.sqrt((ix - cx) ** 2 + (iy - cy) ** 2)
-                    # Smoke rises and spreads
-                    rise = min(t * 0.3, 1.0)
-                    if z_frac < rise:
-                        spread = 3 + z_frac * 5
-                        if r < spread:
-                            density = (1 - r / spread) * min(t / 2.0, 1.0)
-                            density *= (0.5 + 0.5 * z_frac)  # denser at top
-                            smoke[iz, iy, ix] = max(0, density + np.random.normal(0, 0.05))
+        # Vectorized: compute for all voxels at once
+        ix_arr = np.arange(vol_nx)[None, None, :]  # (1, 1, nx)
+        iy_arr = np.arange(vol_ny)[None, :, None]  # (1, ny, 1)
+        iz_arr = np.arange(vol_nz)[:, None, None]  # (nz, 1, 1)
+        r = np.sqrt((ix_arr - cx) ** 2 + (iy_arr - cy) ** 2).astype(np.float32)
+        z_frac = iz_arr / vol_nz
+
+        rise = min(t * 0.3, 1.0)
+        rise_mask = z_frac < rise
+        spread = 3 + z_frac * 5
+        r_mask = r < spread
+        mask = rise_mask & r_mask
+
+        density = (1 - r / (spread + 1e-8)) * min(t / 2.0, 1.0)
+        density = density * (0.5 + 0.5 * z_frac)
+        noise = np.random.normal(0, 0.05, size=(vol_nz, vol_ny, vol_nx)).astype(np.float32)
+        smoke[mask] = np.maximum(0, density[mask] + noise[mask])
 
         result["volume_frames"].append({
             "time": round(t, 2),

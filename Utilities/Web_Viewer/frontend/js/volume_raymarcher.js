@@ -91,24 +91,25 @@ const VolumeShaders = {
             return c;
         }
 
-        // --- Sample volume gradient (for lighting) ---
+        // --- Sample volume gradient (forward-difference, 3 samples vs 6) ---
         vec3 volumeGradient(vec3 p, float step) {
-            float dx = texture(uVolume, p + vec3(step, 0, 0)).r - texture(uVolume, p - vec3(step, 0, 0)).r;
-            float dy = texture(uVolume, p + vec3(0, step, 0)).r - texture(uVolume, p - vec3(0, step, 0)).r;
-            float dz = texture(uVolume, p + vec3(0, 0, step)).r - texture(uVolume, p - vec3(0, 0, step)).r;
+            float center = texture(uVolume, p).r;
+            float dx = texture(uVolume, p + vec3(step, 0, 0)).r - center;
+            float dy = texture(uVolume, p + vec3(0, step, 0)).r - center;
+            float dz = texture(uVolume, p + vec3(0, 0, step)).r - center;
             return normalize(vec3(dx, dy, dz) + 1e-6);
         }
 
-        // --- Light marching (shadow ray) ---
+        // --- Light marching (shadow ray, optimized: 6 samples) ---
         float lightMarch(vec3 pos, vec3 lightDir, int steps) {
             float totalDensity = 0.0;
-            float stepSize = 0.02;
+            float stepSize = 0.035;  // larger steps for shadow (was 0.02)
             vec3 p = pos;
-            for (int i = 0; i < 16; i++) {
+            vec3 invBounds = 1.0 / (uBoundsMax - uBoundsMin);
+            for (int i = 0; i < 6; i++) {
                 if (i >= steps) break;
                 p += lightDir * stepSize;
-                // Convert to texture coords
-                vec3 tc = (p - uBoundsMin) / (uBoundsMax - uBoundsMin);
+                vec3 tc = (p - uBoundsMin) * invBounds;
                 if (any(lessThan(tc, vec3(0.0))) || any(greaterThan(tc, vec3(1.0)))) break;
                 totalDensity += texture(uVolume, tc).r * stepSize * uDensityScale;
             }
@@ -135,9 +136,11 @@ const VolumeShaders = {
             vec4 accumulated = vec4(0.0);
             float transmittance = 1.0;
 
+            vec3 invBoundsSize = 1.0 / (uBoundsMax - uBoundsMin);
+
             for (int i = 0; i < 512; i++) {
                 if (i >= uMaxSteps) break;
-                if (transmittance < 0.01) break;
+                if (transmittance < 0.01) break;  // early termination
 
                 float t = tHit.x + float(i) * stepSize;
                 if (t > tHit.y) break;
@@ -145,10 +148,16 @@ const VolumeShaders = {
                 vec3 pos = vOrigin + rayDir * t;
 
                 // Convert world position to texture coordinates [0, 1]
-                vec3 texCoord = (pos - uBoundsMin) / (uBoundsMax - uBoundsMin);
+                vec3 texCoord = (pos - uBoundsMin) * invBoundsSize;
 
                 // Sample volume
                 float density = texture(uVolume, texCoord).r;
+
+                // Empty space skipping
+                if (density < 0.005) {
+                    // Skip ahead in empty regions
+                    continue;
+                }
 
                 if (density > 0.01) {
                     float scaledDensity = density * uDensityScale;
@@ -211,14 +220,17 @@ class VolumeRayMarcher {
     /**
      * Create 3D volume texture from flat data array.
      */
-    createVolumeTexture(data, nx, ny, nz) {
+    createVolumeTexture(data, nx, ny, nz, maxVal) {
         const floatData = new Float32Array(nx * ny * nz);
 
-        // Normalize
-        let maxVal = 0;
-        for (let i = 0; i < data.length; i++) {
-            maxVal = Math.max(maxVal, data[i]);
+        // Single-pass normalize (use server-provided maxVal if available)
+        if (maxVal === undefined || maxVal <= 0) {
+            maxVal = 0;
+            for (let i = 0; i < data.length; i++) {
+                if (data[i] > maxVal) maxVal = data[i];
+            }
         }
+        this._cachedMaxVal = maxVal;
         const scale = maxVal > 0 ? 1.0 / maxVal : 1.0;
         for (let i = 0; i < data.length; i++) {
             floatData[i] = data[i] * scale;
@@ -257,14 +269,14 @@ class VolumeRayMarcher {
     /**
      * Initialize the volume renderer with data.
      */
-    init(data, nx, ny, nz) {
+    init(data, nx, ny, nz, maxVal) {
         // Remove old mesh
         if (this.mesh) {
             this.scene.remove(this.mesh);
             if (this.volumeTexture) this.volumeTexture.dispose();
         }
 
-        this.volumeTexture = this.createVolumeTexture(data, nx, ny, nz);
+        this.volumeTexture = this.createVolumeTexture(data, nx, ny, nz, maxVal);
         if (!this.volumeTexture) return false;
 
         const b = this.bounds;
@@ -314,16 +326,20 @@ class VolumeRayMarcher {
     /**
      * Update volume data for animation.
      */
-    updateData(data, nx, ny, nz) {
+    updateData(data, nx, ny, nz, maxVal) {
         if (!this.volumeTexture) {
-            return this.init(data, nx, ny, nz);
+            return this.init(data, nx, ny, nz, maxVal);
         }
 
         const floatData = new Float32Array(nx * ny * nz);
-        let maxVal = 0;
-        for (let i = 0; i < data.length; i++) {
-            maxVal = Math.max(maxVal, data[i]);
+        // Use server-provided maxVal to skip finding max
+        if (maxVal === undefined || maxVal <= 0) {
+            maxVal = 0;
+            for (let i = 0; i < data.length; i++) {
+                if (data[i] > maxVal) maxVal = data[i];
+            }
         }
+        this._cachedMaxVal = maxVal;
         const scale = maxVal > 0 ? 1.0 / maxVal : 1.0;
         for (let i = 0; i < data.length; i++) {
             floatData[i] = data[i] * scale;

@@ -296,7 +296,7 @@ async def get_scan_transform():
 
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket):
-    """Stream simulation frames via WebSocket."""
+    """Stream simulation frames via WebSocket (JSON mode for compatibility)."""
     await websocket.accept()
     try:
         while True:
@@ -328,6 +328,66 @@ async def websocket_stream(websocket: WebSocket):
                     })
                     await asyncio.sleep(0.2 / speed)
                 await websocket.send_json({"type": "stream_complete"})
+
+    except WebSocketDisconnect:
+        pass
+
+
+@app.websocket("/ws/binary_stream")
+async def binary_stream(websocket: WebSocket):
+    """
+    Binary WebSocket streaming with backpressure.
+    Protocol:
+      Client sends JSON: {"action": "stream_slices|stream_volume", "speed": 1.0}
+      Server sends binary: [4-byte header_len][JSON header][float32 data]
+      Client sends "ACK" after each frame (backpressure).
+    """
+    await websocket.accept()
+    try:
+        while True:
+            msg = await websocket.receive_text()
+            cmd = json.loads(msg)
+            data = get_demo_data()
+
+            if cmd.get("action") == "stream_slices":
+                frames = data["slices"]
+                frame_type = "slice_frame"
+            elif cmd.get("action") == "stream_volume":
+                frames = data["volume_frames"]
+                frame_type = "volume_frame"
+            else:
+                continue
+
+            for i, frame in enumerate(frames):
+                # Header (small JSON)
+                header = json.dumps({
+                    "type": frame_type,
+                    "frame_index": i,
+                    "total_frames": len(frames),
+                    "time": frame.get("time", 0),
+                    "nx": frame.get("nx", 0),
+                    "ny": frame.get("ny", 0),
+                    "nz": frame.get("nz", 0),
+                    "min_val": frame.get("min_val", 0),
+                    "max_val": frame.get("max_val", 0),
+                }).encode('utf-8')
+
+                # Binary payload: [header_len(4B)][header][float32 data]
+                frame_data = np.array(frame["data"], dtype=np.float32).tobytes()
+                import struct as _struct
+                payload = _struct.pack('<I', len(header)) + header + frame_data
+                await websocket.send_bytes(payload)
+
+                # Wait for client ACK (backpressure)
+                try:
+                    ack = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    break  # Client not responding
+
+            # Signal completion
+            end_header = json.dumps({"type": "stream_complete"}).encode('utf-8')
+            import struct as _struct
+            await websocket.send_bytes(_struct.pack('<I', len(end_header)) + end_header)
 
     except WebSocketDisconnect:
         pass

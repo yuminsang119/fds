@@ -88,15 +88,18 @@ class TriMesh:
         self.bounds_max = self.vertices.max(axis=0)
 
     def compute_normals(self):
-        """Compute per-vertex normals from face normals."""
+        """Compute per-vertex normals from face normals (vectorized)."""
+        v0 = self.vertices[self.faces[:, 0]]
+        v1 = self.vertices[self.faces[:, 1]]
+        v2 = self.vertices[self.faces[:, 2]]
+        face_normals = np.cross(v1 - v0, v2 - v0)
+        norms = np.linalg.norm(face_normals, axis=1, keepdims=True)
+        norms[norms == 0] = 1
+        face_normals /= norms
         self.normals = np.zeros_like(self.vertices)
-        for face in self.faces:
-            v0, v1, v2 = self.vertices[face]
-            normal = np.cross(v1 - v0, v2 - v0)
-            norm = np.linalg.norm(normal)
-            if norm > 0:
-                normal /= norm
-            self.normals[face] += normal
+        np.add.at(self.normals, self.faces[:, 0], face_normals)
+        np.add.at(self.normals, self.faces[:, 1], face_normals)
+        np.add.at(self.normals, self.faces[:, 2], face_normals)
         norms = np.linalg.norm(self.normals, axis=1, keepdims=True)
         norms[norms == 0] = 1
         self.normals /= norms
@@ -205,31 +208,51 @@ def load_ply(filepath: str) -> tuple:
         normals = np.zeros((n_vertices, 3), dtype=np.float32) if nxi >= 0 else None
 
         if is_binary_le or is_binary_be:
-            endian = '<' if is_binary_le else '>'
-            # Build struct format
-            dtype_map = {
-                'float': 'f', 'float32': 'f', 'double': 'd', 'float64': 'd',
-                'uchar': 'B', 'uint8': 'B', 'char': 'b', 'int8': 'b',
-                'short': 'h', 'int16': 'h', 'ushort': 'H', 'uint16': 'H',
-                'int': 'i', 'int32': 'i', 'uint': 'I', 'uint32': 'I',
+            endian_char = '<' if is_binary_le else '>'
+            # Build numpy structured dtype for bulk read
+            np_dtype_map = {
+                'float': 'f4', 'float32': 'f4', 'double': 'f8', 'float64': 'f8',
+                'uchar': 'u1', 'uint8': 'u1', 'char': 'i1', 'int8': 'i1',
+                'short': 'i2', 'int16': 'i2', 'ushort': 'u2', 'uint16': 'u2',
+                'int': 'i4', 'int32': 'i4', 'uint': 'u4', 'uint32': 'u4',
             }
-            fmt = endian + ''.join(dtype_map.get(p[1], 'f') for p in vertex_props)
-            vertex_size = struct.calcsize(fmt)
+            dt_fields = []
+            for name, dtype in vertex_props:
+                np_dt = np_dtype_map.get(dtype, 'f4')
+                dt_fields.append((name, f'{endian_char}{np_dt}'))
+            vertex_dtype = np.dtype(dt_fields)
 
-            for i in range(n_vertices):
-                data = struct.unpack(fmt, f.read(vertex_size))
-                if xi >= 0:
-                    points[i] = [data[xi], data[yi], data[zi]]
-                if colors is not None:
-                    colors[i] = [data[ri], data[gi], data[bi]]
-                if normals is not None:
-                    normals[i] = [data[nxi], data[nyi], data[nzi]]
+            # Bulk read all vertices at once (numpy.frombuffer)
+            raw_bytes = f.read(n_vertices * vertex_dtype.itemsize)
+            raw = np.frombuffer(raw_bytes, dtype=vertex_dtype, count=n_vertices)
+
+            if xi >= 0:
+                x_name = prop_names[xi]
+                y_name = prop_names[yi]
+                z_name = prop_names[zi]
+                points[:, 0] = raw[x_name].astype(np.float32)
+                points[:, 1] = raw[y_name].astype(np.float32)
+                points[:, 2] = raw[z_name].astype(np.float32)
+            if colors is not None:
+                r_name = prop_names[ri]
+                g_name = prop_names[gi]
+                b_name = prop_names[bi]
+                colors[:, 0] = raw[r_name].astype(np.uint8)
+                colors[:, 1] = raw[g_name].astype(np.uint8)
+                colors[:, 2] = raw[b_name].astype(np.uint8)
+            if normals is not None:
+                nx_name = prop_names[nxi]
+                ny_name = prop_names[nyi]
+                nz_name = prop_names[nzi]
+                normals[:, 0] = raw[nx_name].astype(np.float32)
+                normals[:, 1] = raw[ny_name].astype(np.float32)
+                normals[:, 2] = raw[nz_name].astype(np.float32)
 
             # Read faces
             faces_list = []
             for _ in range(n_faces):
-                count = struct.unpack(f'{endian}B', f.read(1))[0]
-                face = struct.unpack(f'{endian}{count}i', f.read(count * 4))
+                count = struct.unpack(f'{endian_char}B', f.read(1))[0]
+                face = struct.unpack(f'{endian_char}{count}i', f.read(count * 4))
                 if count == 3:
                     faces_list.append(face)
                 elif count == 4:

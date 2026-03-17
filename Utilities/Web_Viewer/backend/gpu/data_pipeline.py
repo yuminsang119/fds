@@ -5,6 +5,7 @@ Uses GPU 3 (dedicated) for async data loading and preprocessing.
 
 import numpy as np
 from pathlib import Path
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -46,8 +47,7 @@ class GPUDataPipeline:
 
     def __init__(self, config: PipelineConfig = None):
         self.config = config or PipelineConfig()
-        self.frame_cache = {}
-        self.cache_order = []
+        self.frame_cache = OrderedDict()
         self.executor = ThreadPoolExecutor(max_workers=4)
         self._setup_device()
 
@@ -89,16 +89,19 @@ class GPUDataPipeline:
             if vmax > vmin:
                 tensor = (tensor - vmin) / (vmax - vmin)
 
-            # Gaussian smoothing (3x3x3 kernel)
-            kernel_size = 3
-            sigma = 0.8
-            coords = torch.arange(kernel_size, device=self.device, dtype=torch.float32) - kernel_size // 2
-            kernel_1d = torch.exp(-coords ** 2 / (2 * sigma ** 2))
-            kernel_3d = kernel_1d[:, None, None] * kernel_1d[None, :, None] * kernel_1d[None, None, :]
-            kernel_3d = kernel_3d / kernel_3d.sum()
-            kernel_3d = kernel_3d.reshape(1, 1, kernel_size, kernel_size, kernel_size)
+            # Gaussian smoothing (3x3x3 kernel, cached)
+            if not hasattr(self, '_gauss_kernel_3d') or self._gauss_kernel_3d is None:
+                kernel_size = 3
+                sigma = 0.8
+                coords = torch.arange(kernel_size, device=self.device, dtype=torch.float32) - kernel_size // 2
+                kernel_1d = torch.exp(-coords ** 2 / (2 * sigma ** 2))
+                kernel_3d = kernel_1d[:, None, None] * kernel_1d[None, :, None] * kernel_1d[None, None, :]
+                kernel_3d = kernel_3d / kernel_3d.sum()
+                self._gauss_kernel_3d = kernel_3d.reshape(1, 1, 3, 3, 3)
+            else:
+                kernel_size = 3
 
-            smoothed = F.conv3d(tensor, kernel_3d, padding=kernel_size // 2)
+            smoothed = F.conv3d(tensor, self._gauss_kernel_3d, padding=kernel_size // 2)
 
             # Resize to target
             if target_shape:
@@ -157,18 +160,21 @@ class GPUDataPipeline:
         }
 
     def cache_frame(self, frame_id: str, data: dict):
-        """Cache a preprocessed frame on GPU."""
+        """Cache a preprocessed frame with LRU eviction."""
+        if frame_id in self.frame_cache:
+            self.frame_cache.move_to_end(frame_id)
         self.frame_cache[frame_id] = data
-        self.cache_order.append(frame_id)
 
-        # Evict old frames if cache too large
+        # Evict least-recently-used frames (O(1) with OrderedDict)
         while len(self.frame_cache) > self.config.prefetch_frames * 4:
-            oldest = self.cache_order.pop(0)
-            del self.frame_cache[oldest]
+            self.frame_cache.popitem(last=False)
 
     def get_cached_frame(self, frame_id: str):
-        """Retrieve a cached frame."""
-        return self.frame_cache.get(frame_id)
+        """Retrieve a cached frame (moves to end for LRU)."""
+        if frame_id in self.frame_cache:
+            self.frame_cache.move_to_end(frame_id)
+            return self.frame_cache[frame_id]
+        return None
 
     def prefetch_frames(self, frame_ids: list, data_loader_fn):
         """
@@ -210,7 +216,6 @@ class GPUDataPipeline:
     def cleanup(self):
         """Release all GPU resources."""
         self.frame_cache.clear()
-        self.cache_order.clear()
         self.executor.shutdown(wait=False)
         if self.gpu_available and HAS_TORCH:
             with torch.cuda.device(self.device):

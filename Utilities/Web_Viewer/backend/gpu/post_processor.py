@@ -85,18 +85,24 @@ class GPUPostProcessor:
         return torch.clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0, 1)
 
     def _apply_bloom(self, tensor):
-        """GPU-accelerated bloom effect."""
-        # Extract bright areas
+        """GPU-accelerated bloom with multi-scale downsampled passes."""
         threshold = self.bloom_threshold
         bright = torch.clamp(tensor - threshold, 0, 1)
 
-        # Multi-pass Gaussian blur
+        # Multi-scale bloom: blur at progressively lower resolutions
         blurred = bright
-        for _ in range(3):
-            blurred = self._gaussian_blur(blurred, kernel_size=15, sigma=3.0)
+        bloom_accumulator = torch.zeros_like(tensor)
+        weights = [0.5, 0.3, 0.2]
+        for i, w in enumerate(weights):
+            if i > 0:
+                # Downsample by 2x for each level (4x, 16x fewer pixels)
+                blurred = F.avg_pool2d(blurred, 2)
+            blurred = self._gaussian_blur(blurred, kernel_size=9, sigma=2.0)
+            # Upsample back to original resolution
+            upsampled = F.interpolate(blurred, size=tensor.shape[2:], mode='bilinear', align_corners=False)
+            bloom_accumulator += upsampled * w
 
-        # Composite
-        return tensor + blurred * self.bloom_intensity
+        return tensor + bloom_accumulator * self.bloom_intensity
 
     def _gaussian_blur(self, tensor, kernel_size=15, sigma=3.0):
         """2D Gaussian blur on GPU."""
